@@ -15,7 +15,7 @@ app = FastAPI(title="DIGIT 4W Processor API")
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://digit-excel-private-car.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
