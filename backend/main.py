@@ -1,10 +1,25 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 import pandas as pd
 import io
 import os
-import sys
-import re
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+import traceback
+import tempfile
+import shutil
+
+app = FastAPI(title="DIGIT 4W Processor API")
+
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ===============================================================================
 # FORMULA DATA AND STATE MAPPING
@@ -52,6 +67,9 @@ STATE_MAPPING = {
     "Jammu": "JAMMU AND KASHMIR", "Assam": "ASSAM", "HR Ref": "HARYANA",
     "ROM2": "REST OF MAHARASHTRA", "Andaman": "ANDAMAN AND NICOBAR ISLANDS"
 }
+
+# Store uploaded files temporarily
+uploaded_files = {}
 
 # ===============================================================================
 # CORE CALCULATION FUNCTIONS
@@ -131,35 +149,24 @@ class Pattern4WDetector:
     
     @staticmethod
     def detect_pattern(df: pd.DataFrame) -> str:
-        """
-        Detect the pattern type based on sheet structure.
-        Returns: 'comp_saod' or 'satp'
-        """
-        # Check if it's a dataframe with headers
+        """Detect the pattern type based on sheet structure."""
         if isinstance(df.columns, pd.Index):
             columns = [str(col).upper().strip() for col in df.columns]
             
-            # SATP pattern indicators
             if 'CLUSTER' in columns and 'CD2' in columns:
-                # Check for additional SATP-specific columns
                 if any(keyword in ' '.join(columns) for keyword in ['NEW SEGMENT', 'AGE BAND', 'MAPPING']):
                     return 'satp'
             
-            # Check first few rows for pattern indicators
             first_rows = df.head(10).to_string().upper()
             if 'SATP' in first_rows or 'TP' in first_rows:
                 return 'satp'
         
-        # Check for COMP/SAOD pattern (header=None format)
-        # Look for "Cluster" keyword and CD2 columns in raw data
         df_str = df.head(20).to_string().upper()
         
         if 'CLUSTER' in df_str and 'CD2' in df_str:
-            # Check for COMP/SAOD indicators
             if any(keyword in df_str for keyword in ['COMP', 'SAOD', 'PETROL', 'HEV', 'RENEWAL']):
                 return 'comp_saod'
         
-        # Default to comp_saod
         return 'comp_saod'
     
     @staticmethod
@@ -192,10 +199,6 @@ class CompSaodProcessor:
             df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
             df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
             
-            print(f"\n{'='*80}")
-            print(f"Processing Sheet: {sheet_name} (COMP/SAOD Pattern)")
-            print(f"{'='*80}")
-            
             # Find Cluster column
             cluster_col = None
             for j in range(df.shape[1]):
@@ -204,12 +207,9 @@ class CompSaodProcessor:
                     break
             
             if cluster_col is None:
-                print("❌ ERROR: Could not find 'Cluster' column.")
                 return []
             
-            print(f"✓ Found Cluster column at index {cluster_col}")
-            
-            # Find CD2 columns (any column to the right with "CD2" anywhere in the column)
+            # Find CD2 columns
             cd2_cols = []
             for j in range(cluster_col + 1, df.shape[1]):
                 col_str = df.iloc[:, j].astype(str).str.cat(sep=' ')
@@ -217,12 +217,9 @@ class CompSaodProcessor:
                     cd2_cols.append(j)
             
             if not cd2_cols:
-                print("⚠️  WARNING: No CD2 columns detected.")
                 return []
             
-            print(f"✓ Found {len(cd2_cols)} CD2 columns")
-            
-            # Build full header text for each CD2 column
+            # Build headers
             headers = {}
             cluster_header_row = None
             for i in range(df.shape[0]):
@@ -238,20 +235,17 @@ class CompSaodProcessor:
                     val = df.iloc[i, j]
                     if pd.notna(val):
                         s = str(val).strip()
-                        if "CD2" not in s.upper():  # Exclude the CD2 label itself
+                        if "CD2" not in s.upper():
                             header_parts.append(s)
                 headers[j] = " ".join(header_parts).strip()
             
             # Detect data start row
             if cluster_header_row is not None:
                 data_start_row = cluster_header_row + 1
-                # Skip any fully empty rows after header
                 while data_start_row < df.shape[0] and pd.isna(df.iloc[data_start_row, cluster_col]):
                     data_start_row += 1
             else:
-                data_start_row = 10  # safe fallback
-            
-            print(f"✓ Data starts at row {data_start_row + 1}")
+                data_start_row = 10
             
             # Process data rows
             for i in range(data_start_row, df.shape[0]):
@@ -271,21 +265,15 @@ class CompSaodProcessor:
                     
                     header_text = headers.get(j, "").upper()
                     
-                    # Policy Type detection
                     if "SAOD" in header_text and "COMP" not in header_text:
                         policy_type = "SAOD"
                     elif "COMP" in header_text:
                         policy_type = "COMP"
                     else:
-                        policy_type = "COMP"  # default
+                        policy_type = "COMP"
                     
-                    # Fuel detection
                     fuel = "Petrol" if "PETROL" in header_text and "NON" not in header_text and "CNG" not in header_text else "Non-Petrol (incl. CNG)"
-                    
-                    # HEV vs Non-HEV
                     segment = "Non-HEV" if "NON HEV" in header_text or "NON-HEV" in header_text else "HEV"
-                    
-                    # Renewal?
                     renewal = " (Renewals)" if "RENEWAL" in header_text or "RENEW" in header_text else ""
                     
                     orig_seg = f"PVT CAR {segment} - {fuel}{renewal}".strip()
@@ -310,12 +298,10 @@ class CompSaodProcessor:
                         "Rule Explanation": exp
                     })
             
-            print(f"✓ Successfully extracted {len(records)} records")
             return records
             
         except Exception as e:
-            print(f"❌ ERROR processing COMP/SAOD sheet '{sheet_name}': {e}")
-            import traceback
+            print(f"Error processing COMP/SAOD sheet: {e}")
             traceback.print_exc()
             return []
 
@@ -335,12 +321,6 @@ class SatpProcessor:
         try:
             df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=0)
             
-            print(f"\n{'='*80}")
-            print(f"Processing Sheet: {sheet_name} (SATP Pattern)")
-            print(f"{'='*80}")
-            print(f"Columns: {df.columns.tolist()}")
-            
-            # Process rows
             for idx, row in df.iterrows():
                 cluster = str(row.get('Cluster', '')).strip()
                 if not cluster:
@@ -350,14 +330,11 @@ class SatpProcessor:
                 if payin is None:
                     continue
                 
-                # State mapping
                 state = next((v for k, v in STATE_MAPPING.items() if k.upper() in cluster.upper()), "UNKNOWN")
                 
-                # Get segment info if available
                 new_segment = str(row.get('New Segment Mapping', '')).strip()
                 age_band = str(row.get('New Age Band', '')).strip()
                 
-                # Build segment description
                 segment_desc = "PVT CAR TP"
                 if new_segment and new_segment != 'nan':
                     segment_desc += f" {new_segment}"
@@ -384,12 +361,10 @@ class SatpProcessor:
                     "Rule Explanation": exp
                 })
             
-            print(f"✓ Successfully extracted {len(records)} records")
             return records
             
         except Exception as e:
-            print(f"❌ ERROR processing SATP sheet '{sheet_name}': {e}")
-            import traceback
+            print(f"Error processing SATP sheet: {e}")
             traceback.print_exc()
             return []
 
@@ -400,7 +375,7 @@ class SatpProcessor:
 class Pattern4WDispatcher:
     """Main dispatcher that routes to appropriate 4W pattern processor."""
     
-    PATTERN_PROCESSORS = {
+    PATTERN_PROCESSORS = { 
         'comp_saod': CompSaodProcessor,
         'satp': SatpProcessor
     }
@@ -411,28 +386,15 @@ class Pattern4WDispatcher:
                      override_lob: str = None,
                      override_segment: str = None,
                      override_policy_type: str = None) -> List[Dict]:
-        """
-        Main entry point for processing any 4W sheet.
-        Automatically detects pattern and routes to appropriate processor.
-        """
-        # Load sheet to detect pattern
+        """Main entry point for processing any 4W sheet."""
         try:
-            # Try loading with header first (for SATP)
             df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=0)
         except:
-            # Fallback to no header (for COMP/SAOD)
             df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
         
-        # Detect pattern
         pattern = Pattern4WDetector.detect_pattern(df)
-        pattern_name = Pattern4WDetector.detect_pattern_name(df)
-        
-        print(f"\n🔍 Pattern Detection: {pattern_name}")
-        
-        # Get appropriate processor
         processor_class = Pattern4WDispatcher.PATTERN_PROCESSORS.get(pattern, CompSaodProcessor)
         
-        # Process the sheet
         records = processor_class.process(
             content, sheet_name, override_enabled, 
             override_lob, override_segment, override_policy_type
@@ -441,215 +403,157 @@ class Pattern4WDispatcher:
         return records
 
 # ===============================================================================
-# FILE HANDLING AND EXPORT
+# API ENDPOINTS
 # ===============================================================================
 
-def get_sheet_names(file_path: str) -> List[str]:
-    """Get all sheet names from an Excel file."""
+@app.get("/")
+async def root():
+    return {"message": "DIGIT 4W Processor API", "version": "1.0"}
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload an Excel file and return available worksheets."""
     try:
-        xls = pd.ExcelFile(file_path)
-        return xls.sheet_names
+        # Validate file extension
+        if not file.filename.endswith(('.xlsx', '.xls')):
+            raise HTTPException(status_code=400, detail="Only Excel files (.xlsx, .xls) are allowed")
+        
+        # Read file content
+        content = await file.read()
+        
+        # Get sheet names
+        xls = pd.ExcelFile(io.BytesIO(content))
+        sheets = xls.sheet_names
+        
+        # Store file content with a unique ID
+        file_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uploaded_files[file_id] = {
+            "content": content,
+            "filename": file.filename,
+            "sheets": sheets
+        }
+        
+        return {
+            "file_id": file_id,
+            "filename": file.filename,
+            "sheets": sheets,
+            "message": f"File uploaded successfully. Found {len(sheets)} worksheet(s)."
+        }
+        
     except Exception as e:
-        print(f"❌ ERROR reading file: {e}")
-        return []
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
-def choose_sheet(sheets: List[str]) -> Optional[str]:
-    """Display all sheets and let user choose which one to process."""
-    print("\n" + "="*80)
-    print("📋 Available Sheets in Excel File:")
-    print("="*80)
-    for i, sheet in enumerate(sheets, 1):
-        print(f"{i}. {sheet}")
-    print("="*80)
-    
-    while True:
-        try:
-            choice = input(f"\nEnter sheet number to process (1-{len(sheets)}) or 'q' to quit: ").strip()
-            
-            if choice.lower() == 'q':
-                return None
-            
-            choice_num = int(choice)
-            if 1 <= choice_num <= len(sheets):
-                selected_sheet = sheets[choice_num - 1]
-                print(f"\n✅ Selected: {selected_sheet}")
-                return selected_sheet
-            else:
-                print(f"❌ Please enter a number between 1 and {len(sheets)}")
-        except ValueError:
-            print("❌ Invalid input. Please enter a number or 'q' to quit.")
-
-
-def export_to_excel(records: List[Dict], file_path: str, sheet_name: str) -> str:
-    """Export records to Excel file."""
-    if not records:
-        print("⚠️  No records to export!")
-        return None
-    
+@app.post("/process")
+async def process_sheet(
+    file_id: str,
+    sheet_name: str,
+    override_enabled: bool = False,
+    override_lob: Optional[str] = None,
+    override_segment: Optional[str] = None,
+    override_policy_type: Optional[str] = None
+):
+    """Process a specific worksheet and return results."""
     try:
+        # Check if file exists
+        if file_id not in uploaded_files:
+            raise HTTPException(status_code=404, detail="File not found. Please upload the file again.")
+        
+        file_data = uploaded_files[file_id]
+        content = file_data["content"]
+        
+        # Validate sheet name
+        if sheet_name not in file_data["sheets"]:
+            raise HTTPException(status_code=400, detail=f"Sheet '{sheet_name}' not found in file")
+        
+        # Process the sheet
+        records = Pattern4WDispatcher.process_sheet(
+            content, sheet_name, override_enabled,
+            override_lob, override_segment, override_policy_type
+        )
+        
+        if not records:
+            return {
+                "success": False,
+                "message": "No records extracted. Please check the sheet structure.",
+                "records": [],
+                "count": 0
+            }
+        
+        # Calculate summary statistics
+        states = {}
+        policies = {}
+        payins = []
+        
+        for record in records:
+            state = record.get("State", "Unknown")
+            states[state] = states.get(state, 0) + 1
+            
+            policy = record.get("Policy Type", "Unknown")
+            policies[policy] = policies.get(policy, 0) + 1
+            
+            payin_str = record.get("Payin (CD2)", "0%")
+            try:
+                payin = float(payin_str.replace('%', ''))
+                if payin > 0:
+                    payins.append(payin)
+            except:
+                pass
+        
+        avg_payin = sum(payins) / len(payins) if payins else 0
+        
+        summary = {
+            "total_records": len(records),
+            "states": dict(sorted(states.items(), key=lambda x: x[1], reverse=True)[:10]),
+            "policies": policies,
+            "average_payin": round(avg_payin, 2)
+        }
+        
+        return{
+            "success": True,
+            "message": f"Successfully processed {len(records)} records",
+            "records": records,
+            "count": len(records),
+            "summary": summary
+        }
+        
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing sheet: {str(e)}")
+
+
+@app.post("/export")
+async def export_to_excel(file_id: str, sheet_name: str, records: List[Dict]):
+    """Export processed records to Excel file."""
+    try:
+        if not records:
+            raise HTTPException(status_code=400, detail="No records to export")
+        
+        # Create DataFrame
         df = pd.DataFrame(records)
         
         # Generate output filename
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"{base_name}_Processed_{sheet_name.replace(' ', '_')}_{timestamp}.xlsx"
+        filename = f"Processed_{sheet_name.replace(' ', '_')}_{timestamp}.xlsx"
         
-        df.to_excel(output_file, index=False, sheet_name='Processed')
-        print(f"\n✅ Successfully exported {len(records)} records to: {output_file}")
-        return output_file
+        # Create temporary file
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, filename)
+        
+        # Export to Excel
+        df.to_excel(output_path, index=False, sheet_name='Processed')
+        
+        return FileResponse(
+            path=output_path,
+            filename=filename,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        
     except Exception as e:
-        print(f"❌ ERROR exporting to Excel: {e}")
-        return None
+        raise HTTPException(status_code=500, detail=f"Error exporting file: {str(e)}")
 
 
-def print_summary(records: List[Dict]):
-    """Print a summary of processed records."""
-    if not records:
-        print("\n⚠️  No records to summarize!")
-        return
-    
-    print("\n" + "="*80)
-    print("📊 PROCESSING SUMMARY")
-    print("="*80)
-    print(f"Total Records: {len(records)}")
-    
-    # Group by state
-    states = {}
-    for record in records:
-        state = record.get("State", "Unknown")
-        states[state] = states.get(state, 0) + 1
-    
-    print(f"\nRecords by State:")
-    for state, count in sorted(states.items(), key=lambda x: x[1], reverse=True)[:10]:
-        print(f"  {state}: {count}")
-    
-    # Group by policy type
-    policies = {}
-    for record in records:
-        policy = record.get("Policy Type", "Unknown")
-        policies[policy] = policies.get(policy, 0) + 1
-    
-    print(f"\nRecords by Policy Type:")
-    for policy, count in sorted(policies.items()):
-        print(f"  {policy}: {count}")
-    
-    # Calculate average payin
-    payins = []
-    for record in records:
-        payin_str = record.get("Payin (CD2)", "0%")
-        try:
-            payin = float(payin_str.replace('%', ''))
-            if payin > 0:
-                payins.append(payin)
-        except:
-            pass
-    
-    if payins:
-        avg_payin = sum(payins) / len(payins)
-        print(f"\nAverage Payin: {avg_payin:.2f}%")
-    
-    print("="*80 + "\n")
-
-
-def print_sample_records(records: List[Dict], count: int = 10):
-    """Print sample records."""
-    print(f"\n📋 Sample Records (first {min(count, len(records))}):")
-    print("="*80)
-    for i, record in enumerate(records[:count], 1):
-        print(f"{i}. {record.get('Location/Cluster', 'N/A')} | "
-              f"{record.get('Original Segment', 'N/A')} | "
-              f"Policy: {record.get('Policy Type', 'N/A')} | "
-              f"Payin: {record.get('Payin (CD2)', 'N/A')} → "
-              f"Payout: {record.get('Calculated Payout', 'N/A')}")
-    print("="*80 + "\n")
-
-# ===============================================================================
-# MAIN PROGRAM
-# ===============================================================================
-
-def main():
-    """Main program entry point."""
-    print("\n" + "="*80)
-    print(" " * 15 + "DIGIT 4W PRIVATE CAR UNIFIED PROCESSOR")
-    print("="*80)
-    print("\nThis tool automatically detects and processes 4W Private Car sheets:")
-    print("  • COMP/SAOD Pattern (Comprehensive & Stand Alone Own Damage)")
-    print("  • SATP Pattern (Third Party)")
-    print("="*80 + "\n")
-    
-    # Get file path from user
-    while True:
-        file_path = input("📁 Enter the Excel file path (or 'q' to quit): ").strip()
-        
-        if file_path.lower() == 'q':
-            print("\n👋 Exiting...")
-            return
-        
-        # Remove quotes if present
-        file_path = file_path.strip('"').strip("'")
-        
-        if os.path.exists(file_path):
-            break
-        else:
-            print(f"❌ File not found: {file_path}")
-            print("Please check the path and try again.\n")
-    
-    # Display sheets and let user choose
-    sheets = get_sheet_names(file_path)
-    if not sheets:
-        print("❌ No worksheets found or file is invalid.")
-        return
-    
-    selected_sheet = choose_sheet(sheets)
-    
-    if not selected_sheet:
-        print("\n👋 Exiting...")
-        return
-    
-    # Ask for override options
-    print("\n" + "="*80)
-    print("Override Options (usually not needed)")
-    print("="*80)
-    override_choice = input("Enable override? (y/n): ").strip().lower()
-    override_enabled = override_choice == 'y'
-    
-    override_lob = override_segment = override_policy_type = None
-    if override_enabled:
-        override_lob = input("Enter LOB (e.g. PVT CAR, TW) or press Enter to skip: ").strip().upper() or None
-        override_segment = input("Enter Segment (e.g. PVT CAR COMP + SAOD) or press Enter to skip: ").strip().upper() or None
-        override_policy_type = input("Enter Policy Type (COMP/SAOD/TP) or press Enter to skip: ").strip().upper() or None
-    
-    # Read file once
-    print(f"\n📖 Loading file...")
-    with open(file_path, "rb") as f:
-        content = f.read()
-    
-    # Process the sheet using pattern detection
-    print("\n🚀 Starting processing...")
-    records = Pattern4WDispatcher.process_sheet(
-        content, selected_sheet, override_enabled,
-        override_lob, override_segment, override_policy_type
-    )
-    
-    if not records:
-        print("\n⚠️  No records extracted! Please check the sheet structure.")
-        return
-    
-    # Print summary
-    print_summary(records)
-    
-    # Print sample records
-    print_sample_records(records)
-    
-    # Export to Excel
-    output_file = export_to_excel(records, file_path, selected_sheet)
-    
-    if output_file:
-        print(f"\n✨ Processing complete! Output file: {output_file}")
-    else:
-        print("\n⚠️  Export failed, but processing completed successfully.")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": 
+    import uvicorn 
+    uvicorn.run(app, host="0.0.0.0", port=8000)
